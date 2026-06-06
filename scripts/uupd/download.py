@@ -13,7 +13,6 @@ import hashlib
 import json
 import re
 import subprocess
-import sys
 import requests
 
 
@@ -55,14 +54,14 @@ def download_files(inputs: ConversionInputs, output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     base_url = "https://uupdump.net/files/"
     urls = [base_url + f for f in inputs.files]
-    
+
     # Write aria2 input file
     arena_input = output_dir / "aria2.txt"
-    with open(arena_input, "w") as f:
+    with open(arena_input, "w") as fh:
         for url, local_name in zip(urls, inputs.files):
-            f.write(f"{url}\n")
-            f.write(f"  out={local_name}\n")
-    
+            fh.write(f"{url}\n")
+            fh.write(f"  out={local_name}\n")
+
     # Run aria2
     result = subprocess.run(
         ["aria2c", "-c", "-x4", "-s4", "--dir", str(output_dir), "-i", str(arena_input)],
@@ -70,20 +69,26 @@ def download_files(inputs: ConversionInputs, output_dir: Path) -> list[Path]:
     )
     if result.returncode != 0:
         raise RuntimeError(f"aria2 failed:\n{result.stderr}")
-    
-    # Also download the converter script if URL is present
+
+    # Download ALL converter scripts (both Linux and Windows)
     if inputs.converter_script_url:
-        script_url = inputs.converter_script_url
-        if script_url.startswith("//"):
-            script_url = "https:" + script_url
-        elif script_url.startswith("/"):
-            script_url = "https://uupdump.net" + script_url
-        r = requests.get(script_url, timeout=30)
-        r.raise_for_status()
-        script_path = output_dir / "uup_download_linux.sh"
-        script_path.write_text(r.text)
-        script_path.chmod(0o755)
-    
+        for script_name in ("uup_download_windows.cmd", "uup_download_linux.sh"):
+            script_url = inputs.converter_script_url.replace(
+                inputs.converter_script_url.rsplit("/", 1)[-1], script_name
+            )
+            if script_url.startswith("//"):
+                script_url = "https:" + script_url
+            elif script_url.startswith("/"):
+                script_url = "https://uupdump.net" + script_url
+            try:
+                r = requests.get(script_url, timeout=30)
+                r.raise_for_status()
+                script_path = output_dir / script_name
+                script_path.write_text(r.text)
+                script_path.chmod(0o755)
+            except Exception:
+                pass  # Not all scripts may exist for every build
+
     # Generate hashes manifest
     hashes = {}
     for path in output_dir.iterdir():
@@ -94,7 +99,7 @@ def download_files(inputs: ConversionInputs, output_dir: Path) -> list[Path]:
                     h.update(chunk)
             hashes[path.name] = h.hexdigest()
     (output_dir / "hashes.json").write_text(json.dumps(hashes, indent=2))
-    
+
     return [output_dir / f for f in inputs.files if (output_dir / f).exists()]
 
 
@@ -105,10 +110,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", "-o", default="./uup-files", help="Output directory")
     parser.add_argument("--lang", default="en-US", help="Language code")
     args = parser.parse_args()
-    
+
     inputs = fetch(args.uuid, args.edition, args.lang)
     files = download_files(inputs, Path(args.output_dir))
-    
+
     print(f"Downloaded {len(files)} files to {args.output_dir}/")
     for f in files:
         print(f"  {f.name} ({f.stat().st_size / 1e6:.1f} MB)")

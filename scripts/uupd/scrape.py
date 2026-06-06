@@ -30,7 +30,7 @@ def parse_known_page(html: str) -> list[Build]:
         a = row.find("a", href=_UUID_RE)
         if not a:
             continue
-        m_uuid = _UUID_RE.search(a["href"])
+        m_uuid = _UUID_RE.search(str(a["href"]))
         if not m_uuid:
             continue
         title = a.get_text(strip=True)

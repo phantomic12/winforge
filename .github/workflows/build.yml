@@ -34,7 +34,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       # Map both dispatch types to consistent env vars
       PRODUCT: ${{ inputs.product || github.event.client_payload.product }}
@@ -46,47 +46,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install Python deps
         run: pip install -e .
 
       - name: Sync Intel RST drivers
+        shell: bash
         run: python scripts/drivers/sync_intel_rst.py
 
-      - name: Fetch UUP + build ISO
+      - name: Download UUP files + convert to ISO
         shell: bash
         run: |
-          set -euo pipefail
           mkdir -p artifacts
-          python -m scripts.uupd.download "$UUP_UUID" "$EDITION"
           bash scripts/build/convert.sh "$UUP_UUID" "$EDITION" artifacts/
 
-      - name: Mount ISO + inject drivers + autounattend
+      - name: Inject Intel RST drivers into WIM
         shell: pwsh
         run: |
           $wim = "artifacts/install.wim"
+          if (-not (Test-Path $wim)) {
+            Write-Host "No install.wim found — extracting from ISO"
+            7z x artifacts/iso-in.iso -oartifacts/iso-extract -bd -y | Out-Null
+            Copy-Item artifacts/iso-extract/sources/install.wim $wim
+          }
           $mount = "artifacts/mount"
-          $drivers = Get-ChildItem -Recurse -Directory "drivers/pack/intel-rst" | Where-Object { Test-Path (Join-Path $_.FullName "iaStorAC.inf") }
-          ./scripts/build/dism-helpers.ps1 -WimPath $wim -MountDir $mount -DriverDirs $drivers.FullName
+          $driverDirs = @()
+          $rstRoot = "drivers/pack/intel-rst"
+          if (Test-Path $rstRoot) {
+            Get-ChildItem -Recurse -Directory $rstRoot |
+              Where-Object { Test-Path (Join-Path $_.FullName "iaStorAC.inf") } |
+              ForEach-Object { $driverDirs += $_.FullName }
+          }
+          if ($driverDirs.Count -gt 0) {
+            ./scripts/build/dism-helpers.ps1 -WimPath $wim -MountDir $mount -DriverDirs $driverDirs
+          } else {
+            Write-Host "No Intel RST drivers found — skipping injection"
+          }
 
       - name: Write rendered autounattend to disk
         if: env.AUTOU_XML != ''
         shell: bash
         run: |
           mkdir -p artifacts/autounattend
-          # AUTOU_XML is pre-rendered with secrets; write it directly
-          echo "$AUTOU_XML" > artifacts/autounattend/win11.xml
+          printf '%s' "$AUTOU_XML" > artifacts/autounattend/win11.xml
 
       - name: Repack ISO with autounattend
         shell: bash
         run: |
           AUTOU="artifacts/autounattend/win11.xml"
           [ -f "$AUTOU" ] || AUTOU="autounattend/base.xml"
-          bash scripts/build/repack.sh artifacts/iso-in.iso "artifacts/win11-${EDITION}.iso" artifacts/install.wim "$AUTOU"
+          bash scripts/build/repack.sh \
+            artifacts/iso-in.iso \
+            "artifacts/win11-${EDITION}.iso" \
+            artifacts/install.wim \
+            "$AUTOU"
 
       - name: Assign upload account
         id: assign
@@ -97,21 +114,24 @@ jobs:
           echo "account=$ACCOUNT" >> $GITHUB_OUTPUT
 
       - name: Upload ISO to Google Drive
+        if: env.RCLONE_CONF != ''
         shell: bash
         env:
           RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           bash scripts/rclone/upload.sh \
             "artifacts/win11-${EDITION}.iso" \
-            ${{ steps.assign.outputs.account }} \
+            "${{ steps.assign.outputs.account }}" \
             "iso/${PRODUCT}/" \
             ~/.config/rclone/rclone.conf
 
-      - name: Upload artifact (debug)
+      - name: Upload ISO artifact (debug)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: iso-${{ env.PRODUCT }}-${{ env.EDITION }}
           path: artifacts/*.iso
           retention-days: 7
+          if-no-files-found: ignore

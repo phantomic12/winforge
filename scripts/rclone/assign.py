@@ -25,7 +25,7 @@ def load_accounts(path: Path) -> list[Account]:
         cfg = yaml.safe_load(f) or {}
     out: list[Account] = []
     manifest_path = path.with_suffix(".used.yaml")
-    used = {}
+    used: dict[str, float] = {}
     if manifest_path.exists():
         used = (yaml.safe_load(manifest_path.read_text()) or {})
     for a in cfg.get("accounts", []):
@@ -56,3 +56,14 @@ def assign(product: str, iso_gb: float, accounts: list[Account], cursor: int = 0
     pick = candidates[cursor % len(candidates)]
     info("rclone.assigned", product=product, account=pick.name, used_gb=pick.used_gb, iso_gb=iso_gb)
     return pick.name
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 4:
+        print(f"Usage: {sys.argv[0]} <product> <iso_gb> <accounts_yaml>", file=sys.stderr)
+        sys.exit(1)
+    product = sys.argv[1]
+    iso_gb = float(sys.argv[2])
+    accounts = load_accounts(Path(sys.argv[3]))
+    print(assign(product, iso_gb, accounts))

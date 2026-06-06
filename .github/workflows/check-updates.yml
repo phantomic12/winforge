@@ -14,6 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
       - run: pip install -e .
       - name: Scrape UUP-dump + diff against state
         id: scrape
@@ -24,16 +25,16 @@ jobs:
           from scripts.uupd.scrape import fetch_latest
           from scripts.uupd.diff import load_known, save_known, diff_new
           from scripts.uupd.resolve import resolve
+          from scripts.uupd.scrape import Build
+          from scripts.build.matrix import expand
           from pathlib import Path
-          import json, sys
-          scraped = fetch_latest()
+          import json
+          scraped = [b.to_dict() for b in fetch_latest()]
           state = Path('.state/known.json')
           new = diff_new(state, scraped)
           save_known(state, scraped)
-          from scripts.uupd.scrape import Build
           new_builds = [Build(**{k: b[k] for k in ('title','arch','uuid','added_at')}) for b in new]
           rows = [r for r in (resolve(b) for b in new_builds) if r]
-          from scripts.build.matrix import expand
           matrix = []
           for r in rows:
               for ed in expand(Path('config/editions.yaml'), product=r['name']):
@@ -50,14 +51,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: yoav/winforge-private
+          repository: phantomic12/winforge-private
           token: ${{ secrets.WINFORGE_PRIVATE_TOKEN }}
       - name: Build manifest
         env:
           BUILDS: ${{ needs.check.outputs.builds }}
           GH_TOKEN: ${{ secrets.WINFORGE_PRIVATE_TOKEN }}
         run: |
-          echo "$BUILDS" > manifests/new-builds.json
+          mkdir -p manifests
+          echo "$BUILDS" | python -m json.tool > manifests/new-builds.json
           git config user.name "winforge-bot"
           git config user.email "winforge-bot@users.noreply.github.com"
           git checkout -b "auto/$(date -u +%Y%m%dT%H%M%S)"
