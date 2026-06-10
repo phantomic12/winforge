@@ -1,9 +1,10 @@
 """Generate UUP-dump download+conversion inputs for a build+edition combination.
 
-UUP-dump's modern API is a JSON-ish endpoint `get.php`; for stability we still
-fetch the lang-selection HTML and parse the embedded file list and conversion
-script URL. (The exact endpoint may change; keep this module thin so the
-parse layer can be swapped.)
+UUP-dump's modern API (as of mid-2026):
+- GET /get.php?id=<uuid>&pack=<lang>&edition=<id>
+- Returns HTML with a table of <a href="tlu.dl.delivery.mp.microsoft.com/...">filename</a>
+- An inline <textarea> with a .cmd rename script (Windows) and SHA-1 manifest
+- No separate converter scripts to download — we extract everything from the page
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -17,10 +18,20 @@ import requests
 
 
 @dataclass
+class FileEntry:
+    """One UUP file from the page."""
+    url: str           # Microsoft download URL (CDN)
+    guid_filename: str # The GUID-named file as it comes from the CDN
+    target_name: str   # The friendly name after the rename script runs
+    sha1: str          # Expected SHA-1
+
+
+@dataclass
 class ConversionInputs:
-    files: list[str]
-    converter_script_url: str
-    raw_html: str  # for the script bundle download step
+    files: list[FileEntry]
+    rename_cmd: str    # Windows .cmd script to rename GUIDs → friendly names
+    sha1_manifest: str # sha1sum-compatible text
+    raw_html: str
 
 
 def build_request(uuid: str, edition: str, lang: str = "en-us") -> str:
@@ -31,53 +42,94 @@ def build_request(uuid: str, edition: str, lang: str = "en-us") -> str:
     )
 
 
-_SCRIPT_RE = re.compile(r'href="([^"]+(?:convert|uup_[^"]+\.(?:cmd|sh))[^"]*)"', re.IGNORECASE)
+# Match the new Microsoft CDN URLs in the file table
+_CDN_URL_RE = re.compile(
+    r'<a\s+href="(https?://tlu\.dl\.delivery\.mp\.microsoft\.com/filestreamingservice/files/[^"]+)"\s*>\s*'
+    r'([^<]+?)\s*</a>',
+    re.DOTALL,
+)
+# Match the SHA-1 manifest textarea content
+_SHA1_RE = re.compile(r"^([0-9a-f]{40})\s+\*?(.+?)\s*$", re.MULTILINE)
 
 
 def parse_response(html: str) -> ConversionInputs:
-    files = re.findall(r'href="/?files/([^"]+)"', html)
-    m_script = _SCRIPT_RE.search(html)
-    script_url = m_script.group(1) if m_script else ""
-    return ConversionInputs(files=files, converter_script_url=script_url, raw_html=html)
+    files: list[FileEntry] = []
+    # The page table uses Microsoft CDN URLs. The friendly name is the link text
+    # (which is the target name after the .cmd script renames the GUID file).
+    for m in _CDN_URL_RE.finditer(html):
+        url = m.group(1)
+        target_name = m.group(2).strip()
+        # Extract GUID from URL: .../files/<guid>?...
+        guid_match = re.search(r"/files/([0-9a-f-]{36})", url)
+        if not guid_match:
+            continue
+        guid_filename = guid_match.group(1)
+        files.append(FileEntry(
+            url=url,
+            guid_filename=guid_filename,
+            target_name=target_name,
+            sha1="",  # Filled in by hash lookup below
+        ))
+
+    # Extract the SHA-1 manifest textarea and map sha1 → target_name
+    sha1_by_name: dict[str, str] = {}
+    textareas = re.findall(r"<textarea[^>]*>(.*?)</textarea>", html, re.DOTALL)
+    for ta in textareas:
+        # Skip the .cmd rename script (has @echo + rename) and HTML fragments
+        if "@echo" in ta or "rename" in ta or "<" in ta:
+            continue
+        # Looks like a sha1sum manifest
+        for m in _SHA1_RE.finditer(ta):
+            sha1_by_name[m.group(2).strip()] = m.group(1)
+
+    # Fill in sha1 on each FileEntry
+    for f in files:
+        if f.target_name in sha1_by_name:
+            f.sha1 = sha1_by_name[f.target_name]
+
+    # Extract the .cmd rename script
+    rename_cmd = ""
+    for ta in textareas:
+        if "@echo off" in ta and "rename" in ta:
+            rename_cmd = ta.strip()
+            break
+
+    # Extract the SHA-1 manifest as a separate string
+    sha1_manifest = ""
+    for ta in textareas:
+        if ta.strip() and "@echo" not in ta and ta.strip().split("\n", 1)[0].split()[0:1]:
+            first_line = ta.strip().split("\n", 1)[0]
+            if re.match(r"^[0-9a-f]{40}\s+", first_line):
+                sha1_manifest = ta.strip()
+                break
+
+    return ConversionInputs(
+        files=files,
+        rename_cmd=rename_cmd,
+        sha1_manifest=sha1_manifest,
+        raw_html=html,
+    )
 
 
-def fetch(uuid: str, edition: str, lang: str = "en-US") -> ConversionInputs:
+def fetch(uuid: str, edition: str, lang: str = "en-us") -> ConversionInputs:
     r = requests.get(build_request(uuid, edition, lang), timeout=60)
     r.raise_for_status()
     return parse_response(r.text)
 
 
-def resolve_script_url(base_url: str, script_name: str) -> str:
-    """Resolve a UUP-dump script URL to its platform-specific variant.
-
-    Takes the parsed converter script URL and returns a URL for the
-    requested script_name (e.g. 'uup_download_windows.cmd').
-    """
-    if not base_url:
-        return ""
-    base_dir = base_url.rsplit("/", 1)[0] + "/"
-    if base_url.startswith("//"):
-        return "https:" + base_dir + script_name
-    if base_url.startswith("/"):
-        return "https://uupdump.net" + base_dir + script_name
-    return base_dir + script_name
-
-
 def download_files(inputs: ConversionInputs, output_dir: Path) -> list[Path]:
-    """Download all UUP files via aria2 from the 'files' URLs parsed from the page.
+    """Download all UUP files via aria2 from the Microsoft CDN URLs.
 
-    Returns list of local file paths.
+    Returns list of local file paths (using GUID filenames, as downloaded).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_url = "https://uupdump.net/files/"
-    urls = [base_url + f for f in inputs.files]
 
     # Write aria2 input file
     arena_input = output_dir / "aria2.txt"
     with open(arena_input, "w") as fh:
-        for url, local_name in zip(urls, inputs.files):
-            fh.write(f"{url}\n")
-            fh.write(f"  out={local_name}\n")
+        for f in inputs.files:
+            fh.write(f"{f.url}\n")
+            fh.write(f"  out={f.guid_filename}\n")
 
     # Run aria2
     result = subprocess.run(
@@ -87,33 +139,29 @@ def download_files(inputs: ConversionInputs, output_dir: Path) -> list[Path]:
     if result.returncode != 0:
         raise RuntimeError(f"aria2 failed:\n{result.stderr}")
 
-    # Download ALL converter scripts (both Linux and Windows)
-    if inputs.converter_script_url:
-        for script_name in ("uup_download_windows.cmd", "uup_download_linux.sh"):
-            script_url = resolve_script_url(inputs.converter_script_url, script_name)
-            if not script_url:
-                continue
-            try:
-                r = requests.get(script_url, timeout=30)
-                r.raise_for_status()
-                script_path = output_dir / script_name
-                script_path.write_text(r.text)
-                script_path.chmod(0o755)
-            except Exception:
-                pass  # Not all scripts may exist for every build
+    # Write the rename script
+    if inputs.rename_cmd:
+        rename_path = output_dir / "uup_rename_windows.cmd"
+        rename_path.write_text(inputs.rename_cmd)
+        rename_path.chmod(0o755)
 
-    # Generate hashes manifest
+    # Write the SHA-1 manifest
+    if inputs.sha1_manifest:
+        (output_dir / "SHA1").write_text(inputs.sha1_manifest + "\n")
+
+    # Generate sha256 hashes of what we actually downloaded
     hashes = {}
-    for path in output_dir.iterdir():
-        if path.is_file() and path.suffix in (".cab", ".esd", ".psf", ".msu"):
+    for f in inputs.files:
+        path = output_dir / f.guid_filename
+        if path.exists() and path.stat().st_size > 0:
             h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
                     h.update(chunk)
-            hashes[path.name] = h.hexdigest()
+            hashes[f.guid_filename] = h.hexdigest()
     (output_dir / "hashes.json").write_text(json.dumps(hashes, indent=2))
 
-    return [output_dir / f for f in inputs.files if (output_dir / f).exists()]
+    return [output_dir / f.guid_filename for f in inputs.files if (output_dir / f.guid_filename).exists()]
 
 
 if __name__ == "__main__":
