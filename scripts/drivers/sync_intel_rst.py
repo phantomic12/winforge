@@ -71,8 +71,18 @@ def fetch_latest_metadata() -> tuple[str, str]:
     )
 
 
-def sync(target_root: Path = PACK_ROOT) -> Path:
-    version, url = fetch_latest_metadata()
+def sync(target_root: Path = PACK_ROOT) -> Path | None:
+    """Sync the latest Intel RST/VMD driver pack.
+
+    Returns the driver root Path on success, or None if download is blocked
+    (e.g. Intel's WAF challenges CI bots). Callers should treat None as
+    "skip driver injection, continue build".
+    """
+    try:
+        version, url = fetch_latest_metadata()
+    except Exception as e:
+        error("drivers.metadata_failed", error=str(e))
+        return None
     out_dir = target_root / version
     if (out_dir / ".synced").exists():
         info("drivers.already_synced", version=version, path=str(out_dir))
@@ -80,15 +90,36 @@ def sync(target_root: Path = PACK_ROOT) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     installer = out_dir / "SetupRST.exe"
     info("drivers.downloading", version=version, url=url)
-    with requests.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with installer.open("wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                f.write(chunk)
+    try:
+        with requests.get(url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with installer.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+    except Exception as e:
+        error("drivers.download_failed", error=str(e), url=url)
+        # Clean up the 0-byte / partial file so we retry next run
+        if installer.exists():
+            installer.unlink()
+        return None
+    # Sanity check: 0-byte file means Intel returned an HTML WAF challenge
+    if installer.stat().st_size < 1024:
+        error("drivers.download_failed", reason="empty_or_blocked", url=url,
+              size=installer.stat().st_size)
+        installer.unlink()
+        return None
     extract_dir = out_dir / "extracted"
     extract_dir.mkdir(exist_ok=True)
-    subprocess.run(["7z", "x", "-y", f"-o{extract_dir}", str(installer)], check=True)
-    driver_root = find_driver_root(extract_dir)
+    try:
+        subprocess.run(["7z", "x", "-y", f"-o{extract_dir}", str(installer)], check=True)
+    except subprocess.CalledProcessError as e:
+        error("drivers.extract_failed", error=str(e))
+        return None
+    try:
+        driver_root = find_driver_root(extract_dir)
+    except FileNotFoundError as e:
+        error("drivers.layout_changed", error=str(e))
+        return None
     final = out_dir / "drivers"
     if final.exists():
         shutil.rmtree(final)
@@ -99,8 +130,9 @@ def sync(target_root: Path = PACK_ROOT) -> Path:
 
 
 if __name__ == "__main__":
-    try:
-        sync()
-    except Exception as e:
-        error("drivers.sync_failed", error=str(e))
-        sys.exit(1)
+    result = sync()
+    if result is None:
+        # Graceful skip — log already emitted. Don't fail the build.
+        print("Driver sync skipped (download blocked or layout changed). Continuing without RST driver injection.")
+        sys.exit(0)
+
