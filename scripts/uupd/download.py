@@ -23,10 +23,11 @@ class ConversionInputs:
     raw_html: str  # for the script bundle download step
 
 
-def build_request(uuid: str, edition: str, lang: str = "en-US") -> str:
+def build_request(uuid: str, edition: str, lang: str = "en-us") -> str:
+    """UUP-dump get.php requires id + pack (lang, lowercase) + edition."""
     return (
         f"https://uupdump.net/get.php?id={uuid}"
-        f"&lang={lang}&edition={edition}"
+        f"&pack={lang}&edition={edition}"
     )
 
 
@@ -120,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("uuid", help="UUP-dump build UUID")
     parser.add_argument("edition", help="Edition (professional, enterprise, etc.)")
     parser.add_argument("--output-dir", "-o", default="./uup-files", help="Output directory")
-    parser.add_argument("--lang", default="en-US", help="Language code")
+    parser.add_argument("--lang", default="en-us", help="Language code (lowercase, e.g. en-us)")
     args = parser.parse_args()
 
     inputs = fetch(args.uuid, args.edition, args.lang)

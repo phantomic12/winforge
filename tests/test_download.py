@@ -15,10 +15,20 @@ UUID = "00000000-0000-0000-0000-000000000001"
 
 
 def test_build_request_shapes_query():
-    url = build_request(UUID, edition="professional", lang="en-US")
+    url = build_request(UUID, edition="professional", lang="en-us")
     assert "uupdump.net" in url
     assert UUID in url
     assert "professional" in url.lower() or "edition=" in url.lower()
+    # UUP-dump uses 'pack' (not 'lang') and lowercase lang codes
+    assert "pack=" in url
+    assert "pack=en-us" in url
+
+
+def test_build_request_uses_pack_not_lang():
+    """Regression: UUP-dump changed the param from lang= to pack= in their get.php."""
+    url = build_request(UUID, "professional", "de-de")
+    assert "pack=de-de" in url
+    assert "lang=" not in url
 
 
 def test_parse_response_extracts_file_list():
