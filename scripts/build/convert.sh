@@ -83,23 +83,29 @@ if [ -f "$WORK/converter/convert.sh" ]; then
     # Copy UUP files into the converter's working dir (it expects a UUPs/ subdir)
     mkdir -p "$WORK/converter/UUPs"
     cp -r "$WORK/uup/"* "$WORK/converter/UUPs/" 2>/dev/null || true
-    cd "$WORK/converter"
-    # Default: wim compression, UUPs/ dir, no virtual editions
-    bash convert.sh wim UUPs 0 2>&1 | tee "$OUTDIR/convert.log" | tail -30
-    cd - >/dev/null
+    # Run converter. Output ISO goes to $WORK/converter/.
+    # The converter logs to its own log file internally; we tee stdout to a file
+    # in $WORK (not the relative $OUTDIR) so we always have access regardless of cwd.
+    CONVERT_LOG="$WORK/convert.log"
+    (cd "$WORK/converter" && bash convert.sh wim UUPs 0 2>&1) | tee "$CONVERT_LOG" | tail -30
+    # Copy convert.log to $OUTDIR for debugging
+    cp "$CONVERT_LOG" "$OUTDIR/convert.log" 2>/dev/null || true
 else
     echo "[convert] ERROR: UUP-dump converter missing convert.sh"
     ls "$WORK/converter/"
     exit 1
 fi
 
-# The converter produces the ISO in its working dir
-ISO=$(find "$WORK/converter" -maxdepth 2 -name "*.iso" -type f | head -1)
+# Find the produced ISO. The converter drops it in its own CWD.
+ISO=$(find "$WORK/converter" -maxdepth 2 -name "*.iso" -o -name "*.ISO" -type f 2>/dev/null | head -1)
+if [ -z "$ISO" ]; then
+    ISO=$(find "$WORK" -maxdepth 3 -name "*.iso" -o -name "*.ISO" -type f 2>/dev/null | head -1)
+fi
 if [ -n "$ISO" ]; then
     cp "$ISO" "$OUTDIR/iso-in.iso"
     echo "[convert] ISO created: $OUTDIR/iso-in.iso ($(du -h "$OUTDIR/iso-in.iso" | cut -f1))"
 else
     echo "[convert] ERROR: No ISO produced. Check $OUTDIR/convert.log"
-    find "$WORK/converter" -maxdepth 2 -name "*.iso" -o -name "*.wim" 2>/dev/null | head -5
+    find "$WORK/converter" -maxdepth 2 -type f \( -name "*.iso" -o -name "*.wim" \) 2>/dev/null | head -5
     exit 1
 fi
