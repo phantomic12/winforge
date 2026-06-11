@@ -51,7 +51,7 @@ cd - >/dev/null
 # Use the UUP-dump converter (Windows version) which wraps DISM.
 echo "[convert] Cloning UUP-dump converter..."
 if [ ! -d "$WORK/converter" ]; then
-    git clone --depth=1 https://github.com/uup-dump/converter.git "$WORK/converter" 2>&1 | tail -3
+    GIT_TERMINAL_PROMPT=0 git clone --depth=1 https://github.com/uup-dump/converter.git "$WORK/converter" 2>&1 | tail -3
 fi
 
 echo "[convert] Running UUP-dump converter (this takes 10-30 minutes)..."
