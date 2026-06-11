@@ -213,4 +213,6 @@ if __name__ == "__main__":
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
     for k, v in payload.items():
-        print(f"{k.upper()}={v}")
+        # Quote values so titles with () or spaces don't break shell eval
+        v_escaped = v.replace('"', '\\"')
+        print(f'{k}="{v_escaped}"')

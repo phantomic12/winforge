@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import sys
 import textwrap
 import pytest
 from scripts.profiles.load import (
@@ -102,6 +104,7 @@ def test_profile_to_dispatch_payload_shape():
     )
     payload = p.to_dispatch_payload()
     # Keys are UPPERCASE — these go directly into GitHub Actions env vars
+    # Values are quoted to handle titles with () or spaces
     assert payload == {
         "PROFILE": "my-build",
         "PRODUCT": "win11-24h2",
@@ -112,6 +115,24 @@ def test_profile_to_dispatch_payload_shape():
         "UUP_UUID": "abc-123",
         "UUP_TITLE": "",
     }
+
+
+def test_cli_output_is_eval_safe():
+    """The __main__ output must be eval-safe (values quoted)."""
+    import os
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+    result = subprocess.run(
+        [sys.executable, "-m", "scripts.profiles.load", "win11-prod"],
+        capture_output=True, text=True, cwd=REPO_ROOT, env=env,
+    )
+    assert result.returncode == 0
+    # Each line must be KEY="value" so parens/spaces in titles are safe
+    for line in result.stdout.strip().splitlines():
+        assert line.startswith(('PROFILE=', 'PRODUCT=', 'EDITION=', 'LANGUAGE=',
+                                'COMPRESSION=', 'LABEL=', 'UUP_UUID=', 'UUP_TITLE='))
+        # Values should be wrapped in double quotes
+        _, _, val = line.partition("=")
+        assert val.startswith('"') and val.endswith('"'), f"unquoted: {line!r}"
 
 
 def test_resolve_dispatch_returns_env_shape():
