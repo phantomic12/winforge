@@ -147,41 +147,40 @@ jobs:
       # Checkout logic for the three call modes:
       #
       # 1. workflow_call (called from a config repo):
-      #    - Default checkout checks out the CALLER (config repo)
+      #    - Default checkout checks out the CALLER (config repo) at the root
       #    - We need winforge's scripts; checkout winforge into .winforge/
       # 2. repository_dispatch / workflow_dispatch on phantomic12/winforge:
-      #    - Default checkout checks out winforge itself
-      #    - scripts/ + config/ are already at repo root, no second checkout
+      #    - Default checkout checks out winforge itself at the root
+      #    - scripts/ + config/ are already at repo root
       # 3. repository_dispatch / workflow_dispatch on a non-winforge repo
       #    (e.g. winforge-configs dispatches its own workflow):
-      #    - Default checkout checks out that repo (config + autounattend)
+      #    - Default checkout checks out that repo at the root
       #    - We need winforge's scripts; checkout winforge into .winforge/
       #
       # Detection: if the default checkout is winforge itself (it has
       # scripts/), we don't need a second checkout. Otherwise we do.
       - uses: actions/checkout@v6
-        with:
-          path: caller
 
-      - name: Detect if caller checkout is winforge
+      - name: Detect if default checkout is winforge
         id: detect
         shell: bash
         run: |
-          if [ -d caller/scripts ] && [ -d caller/.github ]; then
+          if [ -d scripts ] && [ -d .github ]; then
             echo "is_winforge=true" >> "$GITHUB_OUTPUT"
-            echo "Detected: caller checkout is winforge itself (self-build mode)"
+            echo "Detected: default checkout is winforge itself (self-build mode)"
           else
             echo "is_winforge=false" >> "$GITHUB_OUTPUT"
-            echo "Detected: caller checkout is a config repo (caller mode)"
+            echo "Detected: default checkout is a config repo (caller mode)"
           fi
 
-      - name: Symlink winforge from caller checkout
+      - name: Symlink .winforge -> . in self-build mode
         if: steps.detect.outputs.is_winforge == 'true'
         shell: bash
         run: |
-          # In self-build mode, the default checkout is winforge itself.
-          # Use it directly by making .winforge a symlink to caller/.
-          ln -s caller .winforge
+          # In self-build mode, the default checkout IS winforge.
+          # Make .winforge a symlink so all subsequent steps can use the
+          # same path regardless of mode.
+          ln -s . .winforge
           ls -la .winforge/ | head -5
 
       - name: Checkout winforge into .winforge/ (caller mode)
@@ -196,11 +195,11 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: .winforge/pyproject.toml
 
       - name: Install Python deps
-        # In self-build mode (.winforge is a symlink to caller/), install
-        # from ./.winforge. In caller mode, same command. Either way,
-        # .winforge/pyproject.toml is the source of truth.
+        # In both modes, install from ./.winforge — it's a symlink to .
+        # in self-build mode, or a real checkout of winforge in caller mode.
         run: pip install -e ./.winforge
         env:
           # Ensure scripts/ is importable even before pip install finishes
@@ -211,19 +210,17 @@ jobs:
         id: profile
         env:
           # The profile loader looks in $CONFIG_ROOT/config/profiles/ first,
-          # then falls back to the winforge repo's config/ (for self-build).
+          # then falls back to ./config (self-build on winforge).
           WINFORGE_CONFIG_ROOT: ${{ env.CONFIG_ROOT }}
         run: |
-          # Pick the right config root: caller-supplied, or $GITHUB_WORKSPACE,
-          # or .winforge/ (self-build).
+          # Pick the right config root: caller-supplied, or the default
+          # checkout (which is the config repo or winforge itself).
           if [ -n "$WINFORGE_CONFIG_ROOT" ]; then
             CFG="$WINFORGE_CONFIG_ROOT"
-          elif [ -d caller/config ]; then
-            CFG="caller"
-          elif [ -d .winforge/config ]; then
-            CFG=".winforge"
-          else
+          elif [ -d config ]; then
             CFG="."
+          else
+            CFG=".winforge"
           fi
           echo "Loading profile from: $CFG/config/profiles/$PROFILE.yaml"
           # Get unquoted KEY=val lines for GITHUB_ENV (env vars don't need quoting)
@@ -265,23 +262,25 @@ jobs:
         run: |
           mkdir -p artifacts/autounattend
           # Pick the most-specific template available, then fall back.
-          # Caller's repo first, then winforge's defaults.
+          # Default checkout (caller's repo) first, then winforge's vendored
+          # defaults. Order: <config_root>/<product>.xml, ./<product>.xml,
+          # .winforge/<product>.xml, ./base.xml, .winforge/base.xml.
           CFG=""
           if [ -n "$CONFIG_ROOT" ]; then CFG="$CONFIG_ROOT"; fi
           TEMPLATE=""
-          for root in "$CFG" caller/autounattend .winforge/autounattend autounattend; do
+          for root in "$CFG" .winforge .; do
             if [ -n "$root" ] && [ -d "$root" ]; then
-              if [ -n "${PRODUCT:-}" ] && [ -f "$root/${PRODUCT}.xml" ]; then
-                TEMPLATE="$root/${PRODUCT}.xml"
+              if [ -n "${PRODUCT:-}" ] && [ -f "$root/autounattend/${PRODUCT}.xml" ]; then
+                TEMPLATE="$root/autounattend/${PRODUCT}.xml"
                 break
-              elif [ -f "$root/base.xml" ]; then
-                TEMPLATE="$root/base.xml"
+              elif [ -f "$root/autounattend/base.xml" ]; then
+                TEMPLATE="$root/autounattend/base.xml"
                 break
               fi
             fi
           done
           if [ -z "$TEMPLATE" ]; then
-            echo "No autounattend template found in $CFG, caller/autounattend, .winforge/autounattend, or autounattend; skipping render"
+            echo "No autounattend template found in $CFG, ., or .winforge; skipping render"
             exit 0
           fi
           echo "Using autounattend template: $TEMPLATE"
@@ -331,14 +330,10 @@ jobs:
           echo "Rendered $TEMPLATE -> artifacts/autounattend/win11.xml ($(wc -c < artifacts/autounattend/win11.xml) bytes)"
 
       - name: Sync Intel RST drivers
-        # In caller mode the script is in .winforge; in self-build mode it's in scripts/.
-        # PYTHONPATH is set globally above; just call it from wherever.
+        # .winforge is a symlink to . in self-build mode, or a real checkout
+        # of winforge in caller mode. Either way, scripts/ is at .winforge/scripts/.
         shell: bash
-        run: |
-          if [ -d .winforge ]; then
-            cd .winforge
-          fi
-          python scripts/drivers/sync_intel_rst.py
+        run: python .winforge/scripts/drivers/sync_intel_rst.py
 
       - name: Download UUP files + convert to ISO
         shell: bash
@@ -346,14 +341,8 @@ jobs:
           COMPRESSION: ${{ env.COMPRESSION }}
         run: |
           mkdir -p artifacts
-          # Pass compression through to convert.sh. The script lives in
-          # .winforge/scripts/build/ for caller mode, scripts/build/ for self-build.
-          if [ -d .winforge ]; then
-            CONVERT=.winforge/scripts/build/convert.sh
-          else
-            CONVERT=scripts/build/convert.sh
-          fi
-          bash "$CONVERT" "$UUP_UUID" "$EDITION" artifacts/ "$COMPRESSION"
+          # Pass compression through to convert.sh.
+          bash .winforge/scripts/build/convert.sh "$UUP_UUID" "$EDITION" artifacts/ "$COMPRESSION"
 
       - name: Inject Intel RST drivers into WIM
         shell: bash
@@ -365,11 +354,8 @@ jobs:
             cp artifacts/iso-extract/sources/install.wim "$WIM"
           fi
           # wimlib can inject drivers on Linux without DISM
-          # Drivers come from whichever repo checked out — in caller mode
-          # we expect the caller to vendor their own RST pack or skip this
-          # step via setting a workflow input. For self-build mode the
-          # driver sync above populated drivers/pack/intel-rst.
-          RST_ROOT="drivers/pack/intel-rst"
+          # Drivers come from .winforge/drivers/pack/intel-rst (synced above).
+          RST_ROOT=".winforge/drivers/pack/intel-rst"
           if [ -d "$RST_ROOT" ]; then
             DRIVERS=$(find "$RST_ROOT" -name "iaStorAC.inf" -printf '%h\n' | head -1)
             if [ -n "$DRIVERS" ]; then
@@ -393,15 +379,10 @@ jobs:
         shell: bash
         run: |
           AUTOU="artifacts/autounattend/win11.xml"
-          [ -f "$AUTOU" ] || AUTOU="autounattend/base.xml"
+          [ -f "$AUTOU" ] || AUTOU=".winforge/autounattend/base.xml"
           # Use the LABEL from the profile for the final ISO filename
           OUT_NAME="${LABEL:-${PRODUCT}-${EDITION}}"
-          if [ -d .winforge ]; then
-            REPACK=.winforge/scripts/build/repack.sh
-          else
-            REPACK=scripts/build/repack.sh
-          fi
-          bash "$REPACK" \
+          bash .winforge/scripts/build/repack.sh \
             artifacts/iso-in.iso \
             "artifacts/${OUT_NAME}.iso" \
             artifacts/install.wim \
@@ -414,8 +395,7 @@ jobs:
           ACCOUNTS_YAML: ${{ secrets.ACCOUNTS_YAML }}
         run: |
           echo "$ACCOUNTS_YAML" > /tmp/accounts.yaml
-          if [ -d .winforge ]; then cd .winforge; fi
-          ACCOUNT=$(python -m scripts.rclone.assign "${PRODUCT}" "6.0" /tmp/accounts.yaml)
+          ACCOUNT=$(cd .winforge && python -m scripts.rclone.assign "${PRODUCT}" "6.0" /tmp/accounts.yaml)
           echo "account=$ACCOUNT" >> $GITHUB_OUTPUT
 
       - name: Upload ISO to Google Drive
@@ -427,12 +407,7 @@ jobs:
           mkdir -p ~/.config/rclone
           printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
           OUT_NAME="${LABEL:-${PRODUCT}-${EDITION}}"
-          if [ -d .winforge ]; then
-            UPLOAD=.winforge/scripts/rclone/upload.sh
-          else
-            UPLOAD=scripts/rclone/upload.sh
-          fi
-          bash "$UPLOAD" \
+          bash .winforge/scripts/rclone/upload.sh \
             "artifacts/${OUT_NAME}.iso" \
             "${{ steps.assign.outputs.account }}" \
             "iso/${PRODUCT}/" \
