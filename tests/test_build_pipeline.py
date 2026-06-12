@@ -56,12 +56,18 @@ def test_build_workflow_defines_required_secrets():
     assert "ACCOUNTS_YAML" in secrets
 
 
-def test_check_updates_targets_correct_private_repo():
-    """check-updates.yml must push to phantomic12/winforge-private (not yoav/...)."""
+def test_check_updates_no_longer_targets_private_repo():
+    """Post-flatten: check-updates.yml must push to the same repo, not a private one."""
     data = yaml.safe_load((WORKFLOWS_DIR / "check-updates.yml").read_text())
     text = json.dumps(data)
-    assert "phantomic12/winforge-private" in text
-    assert "yoav/winforge-private" not in text
+    # No references to the deprecated winforge-private repo
+    assert "winforge-private" not in text
+    # The old cross-repo auth token is gone
+    assert "WINFORGE_PRIVATE_TOKEN" not in text
+    # The PR job uses the default GITHUB_TOKEN via explicit permissions
+    pr_job = data["jobs"].get("open-pr", {})
+    perms = pr_job.get("permissions", {})
+    assert perms.get("contents") == "write"
 
 
 def test_ci_workflow_uses_dev_extras_and_runs_all_checks():
@@ -231,3 +237,51 @@ def test_build_workflow_uses_label_for_output_filename():
     upload_step = next((s for s in steps if "Upload ISO to Google" in s.get("name", "")), None)
     assert upload_step is not None
     assert "LABEL" in upload_step["run"]
+
+
+# --- Disk space + autounattend render (post-flatten changes) ---
+
+def test_build_workflow_frees_disk_space_before_checkout():
+    """build.yml must use easimon/maximize-build-space as the first step
+    (UUP→WIM conversion needs more space than the runner ships with)."""
+    data = yaml.safe_load((WORKFLOWS_DIR / "build.yml").read_text())
+    steps = data["jobs"]["build"]["steps"]
+    assert len(steps) > 0
+    first_step = steps[0]
+    # Action is the documented way (not a hand-rolled script)
+    assert "easimon/maximize-build-space" in first_step.get("uses", "")
+    # Must run before checkout — so the remounted volume is in scope for everything else
+    checkout_idx = next(
+        (i for i, s in enumerate(steps) if "actions/checkout" in s.get("uses", "")),
+        None,
+    )
+    assert checkout_idx is not None and checkout_idx > 0, (
+        "Disk-space step must be the first step, before actions/checkout"
+    )
+
+
+def test_build_workflow_renders_autounattend_from_secrets():
+    """build.yml must have a step that reads secrets and renders {{...}} placeholders."""
+    data = yaml.safe_load((WORKFLOWS_DIR / "build.yml").read_text())
+    steps = data["jobs"]["build"]["steps"]
+    render_step = next(
+        (s for s in steps if "Render autounattend" in s.get("name", "")),
+        None,
+    )
+    assert render_step is not None, "Missing autounattend render step"
+    # Uses the inject_autounattend.render() library
+    assert "inject_autounattend" in render_step["run"]
+    # Reads the secrets
+    env = render_step.get("env", {})
+    assert "LOCAL_ADMIN_PASS" in env
+    assert "LOCAL_ADMIN_NAME" in env
+    # Fails loudly if a secret is missing
+    assert "::error::" in render_step["run"] or "exit 1" in render_step["run"]
+
+
+def test_build_workflow_no_references_to_private_repo():
+    """Post-flatten: build.yml must not reference winforge-private anywhere."""
+    text = (WORKFLOWS_DIR / "build.yml").read_text()
+    assert "winforge-private" not in text
+    assert "secrets: inherit" not in text
+    assert "WINFORGE_PRIVATE_TOKEN" not in text

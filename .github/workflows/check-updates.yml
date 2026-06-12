@@ -47,16 +47,20 @@ jobs:
   open-pr:
     needs: check
     if: needs.check.outputs.builds != '[]' && needs.check.outputs.builds != ''
+    # Pushes new UUP-dump build manifests to THIS same repo as a PR. Pre-flatten
+    # this wrote to phantomic12/winforge-private; post-flatten the manifest is
+    # consumed by config/products.yaml updates. Uses the default GITHUB_TOKEN
+    # (no extra secret needed; cross-repo auth was the only reason
+    # WINFORGE_PRIVATE_TOKEN existed).
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
-        with:
-          repository: phantomic12/winforge-private
-          token: ${{ secrets.WINFORGE_PRIVATE_TOKEN }}
       - name: Build manifest
         env:
           BUILDS: ${{ needs.check.outputs.builds }}
-          GH_TOKEN: ${{ secrets.WINFORGE_PRIVATE_TOKEN }}
         run: |
           mkdir -p manifests
           echo "$BUILDS" | python -m json.tool > manifests/new-builds.json

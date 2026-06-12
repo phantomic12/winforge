@@ -78,6 +78,28 @@ jobs:
       UUP_TITLE: ${{ inputs.uup_title || github.event.client_payload.uup_title }}
       AUTOU_XML: ${{ inputs.autounattend_xml || github.event.client_payload.autounattend_xml || '' }}
     steps:
+      # Free disk space BEFORE checkout (this action remounts $GITHUB_WORKSPACE).
+      # UUP→WIM conversion can hit 8GB+ intermediate; runner ships 25-29GB free
+      # of 84GB total. Concat / and /mnt via LVM to get ~60GB usable.
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          # Leave room for apt installs (~500MB) + a buffer. Conversion peak
+          # is ~8GB WIM + ~5GB UUPs.
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 2048
+          # Strip preinstalled runtimes we don't need. None of these are
+          # used by wimlib/cabextract/genisoimage.
+          remove-android: 'true'
+          remove-dotnet: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          # The build doesn't use Docker (UUP-dump converter is a shell script,
+          # not a container). Pulled images on a fresh runner are minimal
+          # (~0GB) but explicit-true keeps the action deterministic.
+          remove-docker-images: 'true'
+
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
@@ -112,6 +134,64 @@ jobs:
           sudo apt-get install -y aria2 cabextract wimtools chntpw genisoimage xorriso isolinux uuid-runtime
           # xorriso needs isohdpfx.bin from isolinux for hybrid MBR
           ls -la /usr/lib/ISOLINUX/isohdpfx.bin || sudo apt-get install -y syslinux-common
+
+      # Render {{PLACEHOLDER}} tokens in the autounattend template with values
+      # from GitHub Actions Secrets. Writes the rendered XML to AUTOU_XML env
+      # var so the existing "Write rendered autounattend to disk" step picks
+      # it up unchanged. Runs unconditionally — every build should embed
+      # credentials when they're configured.
+      - name: Render autounattend from template + secrets
+        id: render_autou
+        shell: bash
+        env:
+          PRODUCT_KEY: ${{ secrets.PRODUCT_KEY }}
+          LOCAL_ADMIN_NAME: ${{ secrets.LOCAL_ADMIN_NAME }}
+          LOCAL_ADMIN_PASS: ${{ secrets.LOCAL_ADMIN_PASS }}
+          COMPUTER_NAME: ${{ secrets.COMPUTER_NAME }}
+        run: |
+          mkdir -p artifacts/autounattend
+          # Pick the most-specific template available, then fall back.
+          # Order: <product>.xml > base.xml
+          TEMPLATE=""
+          if [ -n "${PRODUCT:-}" ] && [ -f "autounattend/${PRODUCT}.xml" ]; then
+            TEMPLATE="autounattend/${PRODUCT}.xml"
+          elif [ -f "autounattend/base.xml" ]; then
+            TEMPLATE="autounattend/base.xml"
+          else
+            echo "No autounattend template found (autounattend/base.xml missing); skipping render"
+            exit 0
+          fi
+          echo "Using autounattend template: $TEMPLATE"
+          # If the template has no {{...}} placeholders, copy verbatim
+          if ! grep -q '{{' "$TEMPLATE"; then
+            echo "Template $TEMPLATE has no placeholders; copying verbatim"
+            cp "$TEMPLATE" artifacts/autounattend/win11.xml
+            echo "AUTOU_XML=$(cat artifacts/autounattend/win11.xml)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # Render with values from env (each secret already a string)
+          RENDERED=$(PRODUCT_KEY="$PRODUCT_KEY" \
+                     LOCAL_ADMIN_NAME="$LOCAL_ADMIN_NAME" \
+                     LOCAL_ADMIN_PASS="$LOCAL_ADMIN_PASS" \
+                     COMPUTER_NAME="$COMPUTER_NAME" \
+                     python -c "
+          import os, sys
+          from pathlib import Path
+          from scripts.build.inject_autounattend import render
+          keys = ['PRODUCT_KEY', 'LOCAL_ADMIN_NAME', 'LOCAL_ADMIN_PASS', 'COMPUTER_NAME']
+          values = {k: os.environ.get(k, '') for k in keys}
+          src = Path('$TEMPLATE').read_text()
+          sys.stdout.write(render(src, values))
+          ")
+          # Validate: no placeholders left behind (means a secret was missing)
+          if echo "$RENDERED" | grep -q '{{'; then
+            echo "::error::Rendered autounattend still contains {{...}} placeholders. A secret is missing?"
+            echo "$RENDERED" | grep -oE '\{\{[A-Z0-9_]+\}\}' | sort -u
+            exit 1
+          fi
+          printf '%s' "$RENDERED" > artifacts/autounattend/win11.xml
+          echo "AUTOU_XML=$RENDERED" >> "$GITHUB_ENV"
+          echo "Rendered $TEMPLATE -> artifacts/autounattend/win11.xml ($(wc -c < artifacts/autounattend/win11.xml) bytes)"
 
       - name: Sync Intel RST drivers
         shell: bash
