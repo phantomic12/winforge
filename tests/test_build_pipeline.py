@@ -85,8 +85,10 @@ def test_build_workflow_supports_workflow_call_for_caller_repo():
     text = (WORKFLOWS_DIR / "build.yml").read_text()
     assert ".winforge" in text, "build.yml must checkout winforge into .winforge/ for caller mode"
     assert "phantomic12/winforge" in text, "build.yml must reference the winforge repo for caller checkout"
-    # And the install step must support both modes
-    assert "if [ -d .winforge" in text, "build.yml must branch on caller vs self-build mode"
+    # In self-build mode, the default checkout is winforge itself, and
+    # we symlink .winforge -> caller to make the rest of the steps uniform.
+    assert "caller" in text, "build.yml must use a 'caller' subdir for the default checkout"
+    assert "ln -s caller .winforge" in text, "self-build mode must symlink .winforge -> caller"
 
 
 def test_build_workflow_defines_required_secrets():

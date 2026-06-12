@@ -144,37 +144,48 @@ jobs:
           echo "Runner volume after cleanup:"
           df -h /home/runner 2>/dev/null || df -h / || true
 
-      # Dual checkout pattern for reusable workflows.
+      # Checkout logic for the three call modes:
       #
-      # When this workflow is invoked via `uses: phantomic12/winforge/...@v1`
-      # from a config repo, the runner checks out the CALLER's repo by default.
-      # That gives us config/profiles/, autounattend/, etc. — but NOT the
-      # winforge scripts.
+      # 1. workflow_call (called from a config repo):
+      #    - Default checkout checks out the CALLER (config repo)
+      #    - We need winforge's scripts; checkout winforge into .winforge/
+      # 2. repository_dispatch / workflow_dispatch on phantomic12/winforge:
+      #    - Default checkout checks out winforge itself
+      #    - scripts/ + config/ are already at repo root, no second checkout
+      # 3. repository_dispatch / workflow_dispatch on a non-winforge repo
+      #    (e.g. winforge-configs dispatches its own workflow):
+      #    - Default checkout checks out that repo (config + autounattend)
+      #    - We need winforge's scripts; checkout winforge into .winforge/
       #
-      # We then checkout winforge into .winforge/ to get scripts/ + pyproject.toml.
-      # PYTHONPATH points scripts/ at .winforge/scripts/ and we install with
-      # `pip install -e ./.winforge` to get the `scripts.*` imports working.
-      #
-      # When this workflow runs on the winforge repo itself (self-build via
-      # repository_dispatch or workflow_dispatch), the first checkout already
-      # has scripts/, so we skip the second checkout.
-      - name: Checkout caller (config repo)
-        if: github.event_name == 'workflow_call'
-        uses: actions/checkout@v6
+      # Detection: if the default checkout is winforge itself (it has
+      # scripts/), we don't need a second checkout. Otherwise we do.
+      - uses: actions/checkout@v6
         with:
-          # Pin to the caller's HEAD. workflow_call runs in the caller's
-          # context so GITHUB_SHA is the caller's commit, not winforge's.
-          ref: ${{ github.sha }}
+          path: caller
 
-      - name: Checkout winforge (self-build only)
-        if: github.event_name != 'workflow_call'
-        uses: actions/checkout@v6
-        with:
-          # Reuse the working copy — the default checkout already got winforge.
-          path: .
+      - name: Detect if caller checkout is winforge
+        id: detect
+        shell: bash
+        run: |
+          if [ -d caller/scripts ] && [ -d caller/.github ]; then
+            echo "is_winforge=true" >> "$GITHUB_OUTPUT"
+            echo "Detected: caller checkout is winforge itself (self-build mode)"
+          else
+            echo "is_winforge=false" >> "$GITHUB_OUTPUT"
+            echo "Detected: caller checkout is a config repo (caller mode)"
+          fi
 
-      - name: Checkout winforge (caller mode)
-        if: github.event_name == 'workflow_call'
+      - name: Symlink winforge from caller checkout
+        if: steps.detect.outputs.is_winforge == 'true'
+        shell: bash
+        run: |
+          # In self-build mode, the default checkout is winforge itself.
+          # Use it directly by making .winforge a symlink to caller/.
+          ln -s caller .winforge
+          ls -la .winforge/ | head -5
+
+      - name: Checkout winforge into .winforge/ (caller mode)
+        if: steps.detect.outputs.is_winforge == 'false'
         uses: actions/checkout@v6
         with:
           repository: phantomic12/winforge
@@ -187,20 +198,13 @@ jobs:
           cache: pip
 
       - name: Install Python deps
-        # In workflow_call mode, install from .winforge so scripts.* imports work.
-        # In self-build mode, install from . which is winforge itself.
-        run: |
-          if [ -d .winforge ]; then
-            echo "Installing winforge from .winforge/ (caller mode)"
-            pip install -e ./.winforge
-          else
-            echo "Installing winforge from . (self-build mode)"
-            pip install -e .
-          fi
-        # scripts/ is on PYTHONPATH in both modes so the test code can
-        # import scripts.profiles.load etc. even before pip install completes.
+        # In self-build mode (.winforge is a symlink to caller/), install
+        # from ./.winforge. In caller mode, same command. Either way,
+        # .winforge/pyproject.toml is the source of truth.
+        run: pip install -e ./.winforge
         env:
-          PYTHONPATH: ${{ github.workspace }}/.winforge/scripts:${{ github.workspace }}/scripts
+          # Ensure scripts/ is importable even before pip install finishes
+          PYTHONPATH: ${{ github.workspace }}/.winforge/scripts
 
       - name: Resolve profile into build env vars
         if: env.PROFILE != ''
@@ -214,7 +218,9 @@ jobs:
           # or .winforge/ (self-build).
           if [ -n "$WINFORGE_CONFIG_ROOT" ]; then
             CFG="$WINFORGE_CONFIG_ROOT"
-          elif [ -d ".winforge" ]; then
+          elif [ -d caller/config ]; then
+            CFG="caller"
+          elif [ -d .winforge/config ]; then
             CFG=".winforge"
           else
             CFG="."
@@ -263,19 +269,19 @@ jobs:
           CFG=""
           if [ -n "$CONFIG_ROOT" ]; then CFG="$CONFIG_ROOT"; fi
           TEMPLATE=""
-          for root in "$CFG" .winforge .; do
+          for root in "$CFG" caller/autounattend .winforge/autounattend autounattend; do
             if [ -n "$root" ] && [ -d "$root" ]; then
-              if [ -n "${PRODUCT:-}" ] && [ -f "$root/autounattend/${PRODUCT}.xml" ]; then
-                TEMPLATE="$root/autounattend/${PRODUCT}.xml"
+              if [ -n "${PRODUCT:-}" ] && [ -f "$root/${PRODUCT}.xml" ]; then
+                TEMPLATE="$root/${PRODUCT}.xml"
                 break
-              elif [ -f "$root/autounattend/base.xml" ]; then
-                TEMPLATE="$root/autounattend/base.xml"
+              elif [ -f "$root/base.xml" ]; then
+                TEMPLATE="$root/base.xml"
                 break
               fi
             fi
           done
           if [ -z "$TEMPLATE" ]; then
-            echo "No autounattend template found in $CFG, .winforge, or .; skipping render"
+            echo "No autounattend template found in $CFG, caller/autounattend, .winforge/autounattend, or autounattend; skipping render"
             exit 0
           fi
           echo "Using autounattend template: $TEMPLATE"
