@@ -15,7 +15,13 @@ if [[ "$COMPRESSION" != "wim" && "$COMPRESSION" != "esd" ]]; then
 fi
 
 mkdir -p "$OUTDIR"
-WORK=$(mktemp -d)
+# Put temp work in $WORKDIR (defaults to $GITHUB_WORKSPACE if set, else /tmp).
+# $GITHUB_WORKSPACE is the LVM-mounted volume from maximize-build-space
+# (~100GB usable). /tmp lives on /dev/root which is cramped after the LVM
+# image is allocated. A full UUP-dump download is ~5GB and the WIM
+# conversion intermediates can hit 8GB+, so /tmp is not reliable.
+WORKDIR="${WORKDIR:-${GITHUB_WORKSPACE:-/tmp}}"
+WORK=$(mktemp -d -p "$WORKDIR")
 trap 'rm -rf "$WORK"' EXIT
 
 echo "[convert] Fetching UUP files for $UUID / $EDITION..."

@@ -129,6 +129,20 @@ def test_convert_sh_accepts_compression_arg():
     assert 'bash convert.sh "$COMPRESSION"' in text or 'bash convert.sh wim' in text
 
 
+def test_convert_sh_uses_workspace_for_temp_dir():
+    """convert.sh must use $GITHUB_WORKSPACE (not /tmp) for temp work.
+
+    $GITHUB_WORKSPACE is the LVM-mounted volume from
+    easimon/maximize-build-space (~100GB). /tmp lives on /dev/root
+    which is cramped after the LVM image is allocated. A full UUP
+    download is ~5GB and the WIM conversion intermediates can hit 8GB+,
+    so /tmp is not reliable.
+    """
+    text = (REPO_ROOT / "scripts/build/convert.sh").read_text()
+    assert "GITHUB_WORKSPACE" in text
+    assert "mktemp -d -p" in text or "mktemp -d -t" in text or "WORKDIR=" in text
+
+
 def test_repack_sh_finds_iso_builder_from_multiple_sources():
     """repack.sh must look for ISO builders: oscdimg (Windows ADK), xorriso, or genisoimage (Linux)."""
     text = (REPO_ROOT / "scripts/build/repack.sh").read_text()
