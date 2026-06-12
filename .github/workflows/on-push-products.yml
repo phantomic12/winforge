@@ -1,0 +1,93 @@
+name: on-push-products
+
+# When config/products.yaml changes on main (from a merged check-updates PR
+# or a manual edit), dispatch a product-updated event to winforge-configs.
+# winforge-configs' workflow then resolves which profiles use the changed
+# products and triggers builds for each.
+#
+# Push events on main are visible to all users (any consumer with
+# repository_dispatch events enabled on winforge-configs), so we keep
+# the dispatch payload minimal — just the list of product names that
+# changed. winforge-configs will read its own profiles/ to figure out
+# which to build.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - config/products.yaml
+  workflow_dispatch:
+    inputs:
+      products:
+        description: "Comma-separated product names to dispatch (for manual triggers)"
+        required: true
+        type: string
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect which products changed in this push
+        id: detect
+        if: github.event_name == 'push'
+        run: |
+          # Compare the current products.yaml against the previous commit's.
+          # If multiple products changed, list them all.
+          python3 - << 'PY'
+          import os, subprocess, yaml
+          from pathlib import Path
+          old = yaml.safe_load(subprocess.check_output(
+              ['git', 'show', 'HEAD~1:config/products.yaml']
+          ))
+          new = yaml.safe_load(Path('config/products.yaml').read_text())
+          old_map = {p['name']: (p.get('latest_uup_uuid',''), p.get('latest_uup_title',''))
+                     for p in old.get('products', [])}
+          changed = []
+          for p in new.get('products', []):
+              old_uuid, old_title = old_map.get(p['name'], ('', ''))
+              if p.get('latest_uup_uuid') != old_uuid or p.get('latest_uup_title') != old_title:
+                  changed.append(p['name'])
+          # Also detect removals
+          for name in old_map:
+              if name not in {p['name'] for p in new.get('products', [])}:
+                  changed.append(name)
+          print(f"changed_products={','.join(changed)}")
+          with open(os.environ.get('GITHUB_OUTPUT', '/tmp/_out'), 'a') as f:
+              f.write(f"products={','.join(changed)}\n")
+          PY
+        env:
+          GITHUB_OUTPUT: ${{ github.output }}
+      - name: Detect products (manual dispatch)
+        id: detect-manual
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "products=${{ inputs.products }}" >> "$GITHUB_OUTPUT"
+      - name: Dispatch to winforge-configs
+        env:
+          WINFORGE_CONFIGS_TOKEN: ${{ secrets.WINFORGE_CONFIGS_TOKEN }}
+          PRODUCTS: ${{ steps.detect.outputs.products || steps.detect-manual.outputs.products }}
+        run: |
+          if [ -z "$PRODUCTS" ]; then
+            echo "No products changed — nothing to dispatch"
+            exit 0
+          fi
+          if [ -z "$WINFORGE_CONFIGS_TOKEN" ]; then
+            echo "WINFORGE_CONFIGS_TOKEN secret not set — skipping dispatch"
+            echo "Set this secret (a PAT with repo:dispatch scope on winforge-configs)"
+            echo "to enable auto-triggers when products.yaml changes."
+            exit 0
+          fi
+          # Build client_payload as JSON (gh api -f doesn't handle commas in values well)
+          PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'products': '$PRODUCTS'.split(',')}))")
+          echo "Dispatching product-updated to phantomic12/winforge-configs: $PRODUCTS"
+          curl -sS -X POST \
+            -H "Authorization: token $WINFORGE_CONFIGS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/phantomic12/winforge-configs/dispatches" \
+            -d "{\"event_type\": \"product-updated\", \"client_payload\": $PAYLOAD}"
+          echo
+          echo "Dispatched."

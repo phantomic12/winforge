@@ -4,11 +4,25 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch:
 
+# This workflow:
+# 1. Scrapes UUP-dump for new builds
+# 2. Matches each build against config/products.yaml
+# 3. If a product's latest_uup_uuid changes, opens a PR updating products.yaml
+#
+# When the PR is merged, the products.yaml update is live. WinForge's
+# reusable workflow (called from consumer config repos) reads
+# latest_uup_uuid at build time, so new builds will pick up new UUIDs
+# on the next trigger.
+#
+# A separate workflow (on-push-products.yml) watches products.yaml changes
+# and dispatches to winforge-configs to trigger rebuilds for the affected
+# product.
+
 jobs:
   check:
     runs-on: ubuntu-latest
     outputs:
-      builds: ${{ steps.scrape.outputs.builds }}
+      changes: ${{ steps.diff.outputs.changes }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -16,58 +30,122 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: pip install -e .
-      - name: Scrape UUP-dump + diff against state
-        id: scrape
+      - name: Scrape UUP-dump + diff against products.yaml
+        id: diff
         shell: bash
         run: |
-          mkdir -p .state
+          # Find all products whose latest_uup_uuid is empty or whose
+          # latest_uup_title is empty (any change at all triggers an update).
+          # If we don't find any, exit with success and no PR.
           python -c "
           from scripts.uupd.scrape import fetch_latest
-          from scripts.uupd.diff import load_known, save_known, diff_new
-          from scripts.uupd.resolve import resolve
-          from scripts.uupd.scrape import Build
-          from scripts.build.matrix import expand
+          from scripts.uupd.resolve import resolve, CONFIG_PATH as PRODUCTS_YAML
           from pathlib import Path
           import json
+          import yaml
           scraped = [b.to_dict() for b in fetch_latest()]
-          state = Path('.state/known.json')
-          new = diff_new(state, scraped)
-          save_known(state, scraped)
-          new_builds = [Build(**{k: b[k] for k in ('title','arch','uuid','added_at')}) for b in new]
-          rows = [r for r in (resolve(b) for b in new_builds) if r]
-          matrix = []
-          for r in rows:
-              for ed in expand(Path('config/editions.yaml'), product=r['name']):
-                  matrix.append({**r, **ed})
-          print('builds=' + json.dumps(matrix))
+          products = yaml.safe_load(PRODUCTS_YAML.read_text())['products']
+          # Index existing UUIDs by product name
+          existing = {p['name']: p.get('latest_uup_uuid','') for p in products}
+          # Resolve new builds against products
+          from scripts.uupd.scrape import Build
+          changes = []
+          for b in scraped:
+              r = resolve(Build(**{k: b[k] for k in ('title','arch','uuid','added_at')}))
+              if not r:
+                  continue
+              name = r['name']
+              new_uuid = r['uuid']
+              if existing.get(name,'') != new_uuid:
+                  # Find an existing entry (don't re-add if same uuid but different title)
+                  if existing.get(name,'') == new_uuid:
+                      continue
+                  changes.append({
+                      'name': name,
+                      'old_uuid': existing.get(name,''),
+                      'new_uuid': new_uuid,
+                      'new_title': r['title'],
+                  })
+                  # Mark as seen so a later build for same product doesn't double-count
+                  existing[name] = new_uuid
+          print('changes=' + json.dumps(changes))
           " | tee scrape.out
-          BUILDS=$(grep -E '^builds=' scrape.out | sed 's/^builds=//')
-          echo "builds=$BUILDS" >> $GITHUB_OUTPUT
+          CHANGES=$(grep -E '^changes=' scrape.out | sed 's/^changes=//')
+          if [ "$CHANGES" = "[]" ] || [ -z "$CHANGES" ]; then
+            echo "No product UUID changes detected"
+            echo "changes=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Detected product UUID changes:"
+          echo "$CHANGES" | python -m json.tool
+          echo "changes=$CHANGES" >> $GITHUB_OUTPUT
 
   open-pr:
     needs: check
-    if: needs.check.outputs.builds != '[]' && needs.check.outputs.builds != ''
-    # Pushes new UUP-dump build manifests to THIS same repo as a PR. Pre-flatten
-    # this wrote to phantomic12/winforge-private; post-flatten the manifest is
-    # consumed by config/products.yaml updates. Uses the default GITHUB_TOKEN
-    # (no extra secret needed; cross-repo auth was the only reason
-    # WINFORGE_PRIVATE_TOKEN existed).
+    if: needs.check.outputs.changes != '[]' && needs.check.outputs.changes != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v6
-      - name: Build manifest
+        with:
+          # Need full history to compute a sane branch name + avoid shallow-clone bugs
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .
+      - name: Apply changes to products.yaml + open PR
         env:
-          BUILDS: ${{ needs.check.outputs.builds }}
+          CHANGES: ${{ needs.check.outputs.changes }}
         run: |
-          mkdir -p manifests
-          echo "$BUILDS" | python -m json.tool > manifests/new-builds.json
+          pip install pyyaml
+          python -c "
+          import json, sys, yaml
+          from pathlib import Path
+          p = Path('config/products.yaml')
+          data = yaml.safe_load(p.read_text())
+          changes = json.loads('''$CHANGES''')
+          applied = []
+          for c in changes:
+              for prod in data['products']:
+                  if prod['name'] == c['name']:
+                      prod['latest_uup_uuid'] = c['new_uuid']
+                      prod['latest_uup_title'] = c['new_title']
+                      applied.append(c['name'])
+                      break
+          # Write back with a stable key order
+          with p.open('w') as f:
+              f.write('# Auto-updated by .github/workflows/check-updates.yml\n')
+              f.write('# Manual override: edit latest_uup_uuid / latest_uup_title to pin.\n')
+              yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+          print('Applied updates to:', applied)
+          "
           git config user.name "winforge-bot"
           git config user.email "winforge-bot@users.noreply.github.com"
-          git checkout -b "auto/$(date -u +%Y%m%dT%H%M%S)"
-          git add manifests/new-builds.json
-          git commit -m "ci: new UUP-dump builds detected"
-          git push -u origin "HEAD"
-          gh pr create --title "Auto: new UUP-dump builds" --body-file manifests/new-builds.json
+          BRANCH="auto/products-$(date -u +%Y%m%dT%H%M%S)"
+          git checkout -b "$BRANCH"
+          git add config/products.yaml
+          # Heredoc for multi-line commit message; $CHANGES preserves JSON in body.
+          cat > /tmp/commit_msg.txt << 'COMMIT_EOF'
+          ci: bump product UUIDs from UUP-dump scrape
+          COMMIT_EOF
+          echo "" >> /tmp/commit_msg.txt
+          echo '```json' >> /tmp/commit_msg.txt
+          echo "$CHANGES" >> /tmp/commit_msg.txt
+          echo '```' >> /tmp/commit_msg.txt
+          git commit -F /tmp/commit_msg.txt
+          git push -u origin "$BRANCH"
+          # Body shows the diff so reviewers can see what changed
+          BODY=$(python -c "
+          import json
+          changes = json.loads('''$CHANGES''')
+          lines = ['## UUP-dump new builds detected','']
+          for c in changes:
+              lines.append(f\"- **{c['name']}**: {c['old_uuid'][:8] or '(empty)'} → {c['new_uuid'][:8]}\")
+              lines.append(f\"  - title: {c['new_title']}\")
+          print('\n'.join(lines))
+          ")
+          gh pr create --title "Auto: bump product UUIDs" --body "$BODY"

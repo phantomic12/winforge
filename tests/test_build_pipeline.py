@@ -119,6 +119,52 @@ def test_check_updates_no_longer_targets_private_repo():
     assert perms.get("contents") == "write"
 
 
+def test_check_updates_actually_modifies_products_yaml():
+    """check-updates.yml must write a real change to config/products.yaml.
+
+    The old version dropped a manifest in manifests/new-builds.json that
+    nothing consumed. The new version must update latest_uup_uuid in
+    products.yaml so the next build picks up the new build.
+    """
+    text = (WORKFLOWS_DIR / "check-updates.yml").read_text()
+    # The open-pr job must modify config/products.yaml, not manifests/...
+    assert "config/products.yaml" in text, (
+        "check-updates must modify config/products.yaml in the open-pr job"
+    )
+    assert "manifests/new-builds.json" not in text, (
+        "check-updates no longer writes to manifests/ — that's a dead path"
+    )
+    # It must use the resolve() helper to match UUP-dump builds against products
+    assert "from scripts.uupd.resolve import resolve" in text
+    # It must read existing latest_uup_uuid to detect changes
+    assert "latest_uup_uuid" in text
+
+
+def test_on_push_products_dispatches_to_configs_repo():
+    """on-push-products.yml must dispatch to winforge-configs on products.yaml changes.
+
+    This is the trigger for auto-rebuilds when check-updates updates products.yaml.
+    """
+    data = yaml.safe_load((WORKFLOWS_DIR / "on-push-products.yml").read_text())
+    # YAML 1.1 parses 'on' as Python True; handle both
+    triggers = data.get(True) or data.get("on") or {}
+    # Triggered by push to main with changes to config/products.yaml
+    push_config = triggers.get("push", {})
+    assert "main" in push_config.get("branches", []), (
+        "on-push-products must trigger on push to main"
+    )
+    assert "config/products.yaml" in push_config.get("paths", []), (
+        "on-push-products must trigger on changes to config/products.yaml"
+    )
+    # The job must dispatch to winforge-configs
+    text = json.dumps(data)
+    assert "phantomic12/winforge-configs" in text
+    assert "dispatches" in text
+    # Uses WINFORGE_CONFIGS_TOKEN (not WINFORGE_PRIVATE_TOKEN which is the old name)
+    assert "WINFORGE_CONFIGS_TOKEN" in text
+    assert "WINFORGE_PRIVATE_TOKEN" not in text
+
+
 def test_ci_workflow_uses_dev_extras_and_runs_all_checks():
     """ci.yml must pip install -e .[dev] and run pytest/ruff/mypy."""
     data = yaml.safe_load((WORKFLOWS_DIR / "ci.yml").read_text())
