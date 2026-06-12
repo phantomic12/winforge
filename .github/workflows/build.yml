@@ -166,7 +166,13 @@ jobs:
           if ! grep -q '{{' "$TEMPLATE"; then
             echo "Template $TEMPLATE has no placeholders; copying verbatim"
             cp "$TEMPLATE" artifacts/autounattend/win11.xml
-            echo "AUTOU_XML=$(cat artifacts/autounattend/win11.xml)" >> "$GITHUB_ENV"
+            # Multi-line env var — use heredoc with delimiter (see below)
+            {
+              echo "AUTOU_XML<<XML_EOF"
+              cat artifacts/autounattend/win11.xml
+              echo ""
+              echo "XML_EOF"
+            } >> "$GITHUB_ENV"
             exit 0
           fi
           # Render with values from env (each secret already a string)
@@ -190,7 +196,15 @@ jobs:
             exit 1
           fi
           printf '%s' "$RENDERED" > artifacts/autounattend/win11.xml
-          echo "AUTOU_XML=$RENDERED" >> "$GITHUB_ENV"
+          # Multi-line content in $GITHUB_ENV trips Actions' env-file parser
+          # (it expects KEY=value, not block scalars). Use heredoc with a
+          # delimiter, which is the documented way to embed multi-line values.
+          {
+            echo "AUTOU_XML<<XML_EOF"
+            printf '%s' "$RENDERED"
+            echo ""
+            echo "XML_EOF"
+          } >> "$GITHUB_ENV"
           echo "Rendered $TEMPLATE -> artifacts/autounattend/win11.xml ($(wc -c < artifacts/autounattend/win11.xml) bytes)"
 
       - name: Sync Intel RST drivers
