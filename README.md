@@ -27,7 +27,12 @@ Set these at **Settings → Secrets and variables → Actions**:
 | `LOCAL_ADMIN_PASS` | yes* | `{{LOCAL_ADMIN_PASS}}` in autounattend (PlainText) |
 | `COMPUTER_NAME` | optional | `{{COMPUTER_NAME}}` in autounattend |
 | `PRODUCT_KEY` | optional | `{{PRODUCT_KEY}}` in autounattend |
-| `INTEL_RST_TOKEN` | optional | Bearer token for Intel's download CDN (WAF protection) |
+
+**Note on `INTEL_RST_TOKEN`:** No longer needed. Intel RST driver injection
+is opt-in and silently skipped if Intel's download CDN blocks the runner
+(WAF challenge). The build continues and produces an ISO without RST drivers
+in that case. See `scripts/drivers/sync_intel_rst.py` for the graceful-skip
+behavior.
 
 *Required if your autounattend template uses those placeholders. If you only
 use `oobe-skip.xml` (no placeholders), the build skips rendering and uses

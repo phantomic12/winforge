@@ -38,7 +38,11 @@ If a template contains no `{{...}}` placeholders, it's copied verbatim
 | `PRODUCT_KEY` | Rendered into `{{PRODUCT_KEY}}` |
 | `RCLONE_CONF` | rclone config (Google Drive accounts) — used by upload step |
 | `ACCOUNTS_YAML` | `config/accounts.yaml` content (OneDrive/Google Drive account pool) — used by assign step |
-| `INTEL_RST_TOKEN` | Optional. Bearer token for Intel download center (WAF protection) |
+
+**`INTEL_RST_TOKEN` is not required.** Intel RST driver injection is opt-in
+and silently skipped if Intel's download CDN blocks the runner (WAF
+challenge). See `scripts/drivers/sync_intel_rst.py` for the graceful-skip
+behavior.
 
 Set these at: **Settings → Secrets and variables → Actions → New repository secret**
 on this repo (`phantomic12/winforge`).

@@ -46,8 +46,6 @@ on:
         required: true
       ACCOUNTS_YAML:
         required: true
-      INTEL_RST_TOKEN:
-        required: false
   repository_dispatch:
     types: [build-request]
   workflow_dispatch:
